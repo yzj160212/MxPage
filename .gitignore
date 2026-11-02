@@ -66,3 +66,7 @@ next-env.d.ts
 /ui-review/
 /.bg-*.txt
 /scripts/*acceptance.mjs
+
+# python bytecode (tooling)
+__pycache__/
+*.pyc

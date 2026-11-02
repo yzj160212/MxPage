@@ -1,0 +1,128 @@
+name: 上游版本监控
+
+# 轮询 ziguishian/MxPage 的最新 release tag，出现新版就重建 local 分支并启动构建。
+#
+# 为什么构建要显式 dispatch
+# ------------------------
+# 用自动 GITHUB_TOKEN 推送不会触发其他 workflow（"events triggered by the GITHUB_TOKEN
+# do not create new workflow runs"）。workflow_dispatch 明确豁免这条限制，所以这里先推
+# 重建好的分支，再 dispatch local-build.yml 去构建它。
+#
+# 为什么要心跳提交
+# ----------------
+# 公开仓库的定时任务在 60 天无仓库活动后会被 GitHub 自动禁用。上游发版算他们仓库的活动，
+# 不算你的，所以长期安静会把监控悄悄关掉。心跳提交既留下活动痕迹，也让你一眼看到
+# 「最后一次检查是什么时候」。真被禁用了，去 Actions 页面点 Enable；手动按钮任何时候都能用。
+on:
+  schedule:
+    # 一天两次，避开整点（GitHub 官方标注的高负载窗口）。注意 cron 是 UTC。
+    - cron: "23 3,15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mxpage-upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 检查上游版本并重建
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.compare.outputs.updated }}
+      tag: ${{ steps.compare.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: toolbox
+
+      - name: Compare upstream tags
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM="ziguishian/MxPage"
+          FORK="$GITHUB_REPOSITORY"
+
+          # 优先用 latest release；有些项目只打 tag 不发 release，退回 tag 列表。
+          NEWEST="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ -z "$NEWEST" ]; then
+            NEWEST="$(gh api "repos/$UPSTREAM/tags" --jq '.[0].name' 2>/dev/null || true)"
+          fi
+          if [ -z "$NEWEST" ]; then
+            echo "::error::拿不到上游版本号"
+            exit 1
+          fi
+          echo "newest upstream release: $NEWEST"
+          echo "newest=$NEWEST" >> "$GITHUB_OUTPUT"
+
+          # local 永远是「上游 tag + 1 个加固提交」，所以它基于哪个 tag 就是 head 的父提交。
+          # 上游用轻量 tag（tag 直接指向 commit），比 SHA 就够，不用 clone。
+          BASE_SHA="$(gh api "repos/$FORK/commits/local" --jq '.parents[0].sha' 2>/dev/null || echo "")"
+          BASE_TAG=""
+          if [ -n "$BASE_SHA" ]; then
+            BASE_TAG="$(gh api "repos/$UPSTREAM/git/refs/tags" --paginate \
+              --jq ".[] | select(.object.sha == \"$BASE_SHA\") | .ref" \
+              | sed 's|^refs/tags/||' | head -1)"
+          fi
+          echo "local branch currently built on: ${BASE_TAG:-(unknown)}"
+
+          if [ "$NEWEST" = "$BASE_TAG" ]; then
+            echo "up to date"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "a new release is available: $NEWEST"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$NEWEST" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Heartbeat
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p .watch
+          {
+            echo "last_check: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "newest_upstream: ${{ steps.compare.outputs.tag || 'unknown' }}"
+            echo "updated: ${{ steps.compare.outputs.updated }}"
+          } > .watch/last-check
+          git add .watch/last-check
+          git commit -qm "chore(watch): upstream check $(date -u +%Y-%m-%d)" || true
+          git push origin HEAD:toolbox || true
+
+      - name: Rebuild the hardened branch
+        if: steps.compare.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 全新 checkout 只有 origin（你的 fork）。加上 upstream 才能取到新 tag。
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/ziguishian/MxPage.git" 2>/dev/null || true
+          git fetch --no-tags upstream --tags
+
+          python3 tools/local/sync_local.py \
+            --tag "${{ steps.compare.outputs.tag }}" \
+            --upstream upstream \
+            --target origin \
+            --force
+
+      - name: Start the build
+        if: steps.compare.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch 豁免「bot 推送不触发 workflow」这条规则。
+          gh workflow run local-build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref local
+          echo "dispatched build against local@${{ steps.compare.outputs.tag }}"

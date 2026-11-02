@@ -1,0 +1,378 @@
+diff --git a/app/api/files/[...path]/route.ts b/app/api/files/[...path]/route.ts
+index ec9d23d..df9dd3c 100644
+--- a/app/api/files/[...path]/route.ts
++++ b/app/api/files/[...path]/route.ts
+@@ -1,5 +1,7 @@
++import path from "node:path";
++
+ import { readStorageFile } from "@/lib/storage/asset-manager";
+-import { handleRouteError } from "@/lib/utils/route";
++import { fail, handleRouteError } from "@/lib/utils/route";
+ 
+ function getContentType(pathname: string) {
+   const normalized = pathname.toLowerCase();
+@@ -18,7 +20,20 @@ export async function GET(
+   context: { params: { path: string[] } },
+ ) {
+   try {
+-    const relativePath = context.params.path.join("/");
++    const segments = context.params.path;
++    const unsafe = segments.some(
++      segment =>
++        !segment ||
++        segment === "." ||
++        segment === ".." ||
++        // A single URL segment must never carry a path separator, even when the
++        // client encodes it (%2f / %5c) so the router cannot split it for us.
++        /[\/\\\0]/.test(segment) ||
++        path.isAbsolute(segment),
++    );
++    if (unsafe) return fail("INVALID_PATH", "文件路径无效。", null, 400);
++
++    const relativePath = segments.join("/");
+     const buffer = await readStorageFile(relativePath);
+     const contentType = getContentType(relativePath);
+ 
+diff --git a/desktop/agent-policy.cjs b/desktop/agent-policy.cjs
+index e85dcae..fbb6d3f 100644
+--- a/desktop/agent-policy.cjs
++++ b/desktop/agent-policy.cjs
+@@ -1,9 +1,18 @@
+ const path = require("node:path");
++const fs = require("node:fs");
+ const allowedTools = new Set(["doctor", "control_status", "discover_applications", "get_frontmost_app", "list_windows", "get_window", "screenshot", "get_ui_tree", "get_focused_element", "find_element", "list_menu_bar", "get_app_capabilities", "open_application", "activate_app", "activate_window", "resize_window", "set_target", "click", "left_click", "double_click", "right_click", "scroll", "type", "key", "click_element", "set_value", "press_button", "select_menu_item"]);
+ const observations = new Set(["screenshot", "get_ui_tree", "get_focused_element", "find_element", "list_menu_bar"]);
+ const reads = new Set(["doctor", "control_status", "discover_applications", "get_frontmost_app", "list_windows", "get_window", "screenshot", "get_ui_tree", "get_focused_element", "find_element", "list_menu_bar", "get_app_capabilities"]);
+ const forbiddenApps = /(?:^|[.\\/])(cmd|powershell|pwsh|bash|zsh|terminal|iterm2?|windowsterminal|osascript)(?:[.\\/]|$)/i;
+ function normalized(value) { return String(value || "").trim().toLowerCase().replace(/\.exe$/, ""); }
++// Resolve symlinks before comparing so a link inside an approved directory cannot
++// point at a file outside of it. Non-existent paths keep their lexical resolution.
++function canonical(input) {
++  const resolved = path.resolve(input);
++  let real = resolved;
++  try { real = fs.realpathSync(resolved); } catch { /* Path does not exist yet. */ }
++  return process.platform === "win32" ? real.toLowerCase() : real;
++}
+ function appAllowed(grant, value) { return Boolean(value) && !forbiddenApps.test(value) && grant.plan.applications.some(app => normalized(app) === normalized(value)); }
+ function checkPaths(grant, value) {
+   if (value && typeof value === "object") { for (const item of Object.values(value)) checkPaths(grant, item); return; }
+@@ -11,7 +20,6 @@ function checkPaths(grant, value) {
+   // Explicit paths supplied to UI tools must stay in approved directories. GUI
+   // applications still run in the real user's session; this is not OS isolation.
+   if (!path.isAbsolute(value)) return;
+-  const canonical = input => process.platform === "win32" ? path.resolve(input).toLowerCase() : path.resolve(input);
+   const resolved = canonical(value);
+   if (!grant.plan.directories.some(dir => { const root = canonical(dir); return resolved === root || resolved.startsWith(root + path.sep); })) throw new Error("文件路径超出批准的目录范围。");
+ }
+diff --git a/lib/agent/http.ts b/lib/agent/http.ts
+index d67d308..c4e2f80 100644
+--- a/lib/agent/http.ts
++++ b/lib/agent/http.ts
+@@ -6,10 +6,20 @@ export function agentCredentials(request: NextRequest): AgentCredentials {
+   try { const raw = JSON.parse(request.headers.get("x-mxpage-mcp-tokens") || "{}"); for (const [id, token] of Object.entries(raw)) if (typeof token === "string" && token.length < 5000) tokens[id] = token; } catch { /* Missing optional tool credentials. */ }
+   return { ...readProviderCredentialsFromRequest(request), tavilyKey: request.headers.get("x-mxpage-tavily-key") || undefined, mcpTokens: tokens };
+ }
++const LOCAL_HOST = /^(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d+)?$/i;
+ export function sameOrigin(request: NextRequest) {
++  const host = request.headers.get("host") || "";
++  // The local server is loopback-only. Rejecting a non-loopback Host closes the
++  // DNS-rebinding hole where a hostile origin resolves its own domain to 127.0.0.1,
++  // making Origin and Host agree on the attacker's hostname.
++  if (!LOCAL_HOST.test(host)) throw new Error("Agent: 拒绝非本机来源的请求。");
+   const origin = request.headers.get("origin");
+-  // Next's internal request URL can use localhost behind the standalone server.
+-  // The browser's Origin must match the actual Host header, not that internal URL.
+-  if (origin && new URL(origin).host !== request.headers.get("host")) throw new Error("Agent: 拒绝跨站修改请求。");
++  if (origin) {
++    // Next's internal request URL can use localhost behind the standalone server.
++    // The browser's Origin must match the actual Host header, not that internal URL.
++    let originHost: string | null = null;
++    try { originHost = new URL(origin).host; } catch { originHost = null; }
++    if (!originHost || originHost !== host) throw new Error("Agent: 拒绝跨站修改请求。");
++  }
+   if (!["same-origin", "none", null].includes(request.headers.get("sec-fetch-site"))) throw new Error("Agent: 拒绝跨站请求。");
+ }
+diff --git a/lib/storage/asset-manager.ts b/lib/storage/asset-manager.ts
+index 22fe152..355a500 100644
+--- a/lib/storage/asset-manager.ts
++++ b/lib/storage/asset-manager.ts
+@@ -182,10 +182,22 @@ export function assetPublicUrl(asset: Pick<ProductAsset, "filePath"> | null | un
+   return relativeStorageUrl(asset.filePath);
+ }
+ 
++// Resolve a storage-relative path and prove it stays inside STORAGE_ROOT.
++// Both the lexical path and its realpath (after resolving symlinks) must stay
++// within the root, so neither `../` segments nor symlinks can escape the store.
++async function resolveStorageFile(relativePath: string) {
++  const root = await fs.realpath(rootDir()).catch(() => path.resolve(rootDir()));
++  const target = path.resolve(root, String(relativePath ?? ""));
++  if (target !== root && !target.startsWith(root + path.sep)) throw Object.assign(new Error("文件路径越界。"), { code: "INVALID_PATH" });
++  const real = await fs.realpath(target);
++  if (real !== root && !real.startsWith(root + path.sep)) throw Object.assign(new Error("文件路径越界。"), { code: "INVALID_PATH" });
++  return real;
++}
++
+ export async function readStorageFile(relativePath: string) {
+-  return fs.readFile(path.join(rootDir(), relativePath));
++  return fs.readFile(await resolveStorageFile(relativePath));
+ }
+ 
+ export async function statStorageFile(relativePath: string) {
+-  return fs.stat(path.join(rootDir(), relativePath));
++  return fs.stat(await resolveStorageFile(relativePath));
+ }
+diff --git a/lib/utils/route.ts b/lib/utils/route.ts
+index 0d689e1..6d0b26a 100644
+--- a/lib/utils/route.ts
++++ b/lib/utils/route.ts
+@@ -86,6 +86,7 @@ export function handleRouteError(error: unknown) {
+       return fail(code, message, { source: "upstream", upstreamStatus: status }, status);
+     }
+     if (code === "P2025") return fail("NOT_FOUND", requestErrorMessage(error), null, 404);
++    if (code === "INVALID_PATH") return fail("INVALID_PATH", requestErrorMessage(error), null, 400);
+     if (code === "ENOENT") return fail("ASSET_MISSING", requestErrorMessage(error), null, 409);
+     if (["P1001", "P1002", "P1008", "P2024", "P2034"].includes(code || "")) return fail("SERVICE_BUSY", "本地服务暂时繁忙，请稍后刷新。已有结果已保留。", null, 503);
+     const providerError = mapProviderError(error);
+diff --git a/middleware.ts b/middleware.ts
+new file mode 100644
+index 0000000..915bb72
+--- /dev/null
++++ b/middleware.ts
+@@ -0,0 +1,40 @@
++import { NextResponse, type NextRequest } from "next/server";
++
++// MxPage's HTTP surface is a loopback-only, single-user local service. It has no
++// authentication, so the only thing that keeps another web page (or a DNS-rebinding
++// domain) out is a strict origin check. Enforce it once, for every API route.
++const LOCAL_HOST = /^(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d+)?$/i;
++const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
++
++function forbidden(code: string, message: string) {
++  return NextResponse.json({ ok: false, error: { code, message } }, { status: 403 });
++}
++
++export function middleware(request: NextRequest) {
++  const host = request.headers.get("host") || "";
++  // Reject non-loopback Hosts on every method. A DNS-rebinding page resolves its
++  // own domain to 127.0.0.1, so Origin and Host both look "same-origin" while the
++  // real origin is remote. Only a loopback Host can be the local service.
++  if (!LOCAL_HOST.test(host)) return forbidden("FORBIDDEN_ORIGIN", "仅允许从本机访问本地服务。");
++
++  if (MUTATING.has(request.method.toUpperCase())) {
++    const origin = request.headers.get("origin");
++    if (origin) {
++      let originHost: string | null = null;
++      try {
++        originHost = new URL(origin).host;
++      } catch {
++        originHost = null;
++      }
++      if (!originHost || originHost !== host) return forbidden("FORBIDDEN_ORIGIN", "拒绝跨站修改请求。");
++    }
++    const site = request.headers.get("sec-fetch-site");
++    if (site && !["same-origin", "none"].includes(site)) return forbidden("FORBIDDEN_ORIGIN", "拒绝跨站请求。");
++  }
++
++  return NextResponse.next();
++}
++
++export const config = {
++  matcher: ["/api/:path*"],
++};
+\ No newline at end of file
+diff --git a/tests/api-origin-guard.test.ts b/tests/api-origin-guard.test.ts
+new file mode 100644
+index 0000000..d0d71a0
+--- /dev/null
++++ b/tests/api-origin-guard.test.ts
+@@ -0,0 +1,54 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { middleware } from "../middleware";
++import { NextRequest } from "next/server";
++
++const LOCAL = "127.0.0.1:3000";
++
++function guard(url: string, init: { method?: string; headers?: Record<string, string> } = {}) {
++  return middleware(new NextRequest(url, init as never));
++}
++
++function isPass(response: Response) {
++  return response.headers.get("x-middleware-next") === "1";
++}
++
++test("拒绝非本机 Host（DNS rebinding 防护）", async () => {
++  const get = guard("http://evil.com:3000/api/projects", { headers: { host: "evil.com:3000" } });
++  assert.equal(get.status, 403);
++  const post = guard("http://evil.com:3000/api/projects", {
++    method: "POST",
++    headers: { host: "evil.com:3000", origin: "http://evil.com:3000" },
++  });
++  assert.equal(post.status, 403);
++});
++
++test("拒绝跨站 Origin 的写请求", async () => {
++  const response = guard("http://127.0.0.1:3000/api/projects", {
++    method: "POST",
++    headers: { host: LOCAL, origin: "http://evil.com", "sec-fetch-site": "cross-site" },
++  });
++  assert.equal(response.status, 403);
++});
++
++test("放行同源写请求", async () => {
++  const response = guard("http://127.0.0.1:3000/api/projects", {
++    method: "POST",
++    headers: { host: LOCAL, origin: `http://${LOCAL}`, "sec-fetch-site": "same-origin" },
++  });
++  assert.ok(isPass(response), `status=${response.status}`);
++});
++
++test("放行无 Origin 的本机客户端（curl / 脚本）", async () => {
++  const response = guard("http://127.0.0.1:3000/api/projects", {
++    method: "POST",
++    headers: { host: LOCAL },
++  });
++  assert.ok(isPass(response), `status=${response.status}`);
++});
++
++test("放行本机只读请求", async () => {
++  const response = guard("http://127.0.0.1:3000/api/files/a.png", { headers: { host: LOCAL } });
++  assert.ok(isPass(response), `status=${response.status}`);
++});
+\ No newline at end of file
+diff --git a/tests/desktop-policy.test.ts b/tests/desktop-policy.test.ts
+new file mode 100644
+index 0000000..227f654
+--- /dev/null
++++ b/tests/desktop-policy.test.ts
+@@ -0,0 +1,49 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { createRequire } from "node:module";
++import test from "node:test";
++
++const require = createRequire(import.meta.url);
++const { validateCall } = require("../desktop/agent-policy.cjs") as {
++  validateCall: (grant: unknown, name: string, args: Record<string, unknown>) => unknown;
++};
++
++const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mxpage-policy-guard-"));
++const approved = path.join(tmp, "approved");
++fs.mkdirSync(approved, { recursive: true });
++fs.writeFileSync(path.join(approved, "inside.txt"), "ok");
++fs.writeFileSync(path.join(tmp, "outside.txt"), "outside");
++fs.symlinkSync(tmp, path.join(approved, "link"));
++
++const grant = {
++  stopped: false,
++  plan: {
++    applications: ["com.apple.TextEdit"],
++    directories: [approved],
++    tools: ["computer"],
++  },
++};
++
++test("批准目录内的真实文件通过", () => {
++  assert.doesNotThrow(() => validateCall(grant, "type", { path: path.join(approved, "inside.txt") }));
++});
++
++test("批准目录内的符号链接不能指向目录外", () => {
++  assert.throws(
++    () => validateCall(grant, "type", { path: path.join(approved, "link", "outside.txt") }),
++    /超出批准的目录范围/,
++  );
++});
++
++test("批准目录本身之外的绝对路径被拒绝", () => {
++  assert.throws(
++    () => validateCall(grant, "type", { path: path.join(tmp, "outside.txt") }),
++    /超出批准的目录范围/,
++  );
++});
++
++test.after(() => {
++  fs.rmSync(tmp, { recursive: true, force: true });
++});
+\ No newline at end of file
+diff --git a/tests/storage-path-traversal.test.ts b/tests/storage-path-traversal.test.ts
+new file mode 100644
+index 0000000..e210abc
+--- /dev/null
++++ b/tests/storage-path-traversal.test.ts
+@@ -0,0 +1,72 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import test, { before } from "node:test";
++
++const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mxpage-storage-guard-"));
++const storage = path.join(tmp, "storage");
++fs.mkdirSync(path.join(storage, "uploads"), { recursive: true });
++fs.writeFileSync(path.join(storage, "ok.txt"), "hello");
++fs.writeFileSync(path.join(tmp, "secret.txt"), "SECRET-OUTSIDE-ROOT");
++
++type FileRoute = {
++  GET: (request: Request, context: unknown) => Promise<Response>;
++};
++type StorageModule = {
++  readStorageFile: (relativePath: string) => Promise<Buffer>;
++};
++
++let route: FileRoute;
++let storageModule: StorageModule;
++
++before(async () => {
++  process.env.STORAGE_ROOT = storage;
++  process.env.APP_SECRET = process.env.APP_SECRET || "local-build-secret-value";
++  process.env.DATABASE_URL = process.env.DATABASE_URL || "file:./dev.db";
++  route = (await import("../app/api/files/[...path]/route")) as FileRoute;
++  storageModule = (await import("../lib/storage/asset-manager")) as StorageModule;
++});
++
++const call = (segments: string[]) =>
++  route.GET(new Request("http://127.0.0.1/api/files/x", { method: "GET" }), {
++    params: { path: segments },
++  });
++
++test("文件路由拒绝穿越路径段", async () => {
++  for (const segments of [
++    ["..", "secret.txt"],
++    ["..", "..", "secret.txt"],
++    ["..\\secret.txt"],
++    ["..\/secret.txt"],
++    ["/etc/passwd"],
++  ]) {
++    const response = await call(segments);
++    assert.equal(response.status, 400, `segments=${segments.join("|")}`);
++  }
++});
++
++test("越过存储根的读请求以 400 拒绝，不泄露内容", async () => {
++  const response = await call(["..", "..", "secret.txt"]);
++  assert.equal(response.status, 400);
++  assert.ok(!(await response.text()).includes("SECRET-OUTSIDE-ROOT"));
++});
++
++test("readStorageFile 阻止越出 STORAGE_ROOT", async () => {
++  await assert.rejects(() => storageModule.readStorageFile("../../secret.txt"));
++});
++
++test("readStorageFile 阻止符号链接逃逸", async () => {
++  fs.symlinkSync(tmp, path.join(storage, "link"));
++  await assert.rejects(() => storageModule.readStorageFile("link/secret.txt"));
++});
++
++test("正常文件仍可读取", async () => {
++  const response = await call(["ok.txt"]);
++  assert.equal(response.status, 200);
++  assert.equal(await response.text(), "hello");
++});
++
++test.after(() => {
++  fs.rmSync(tmp, { recursive: true, force: true });
++});
+\ No newline at end of file
