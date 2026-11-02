@@ -182,10 +182,22 @@ export function assetPublicUrl(asset: Pick<ProductAsset, "filePath"> | null | un
   return relativeStorageUrl(asset.filePath);
 }
 
+// Resolve a storage-relative path and prove it stays inside STORAGE_ROOT.
+// Both the lexical path and its realpath (after resolving symlinks) must stay
+// within the root, so neither `../` segments nor symlinks can escape the store.
+async function resolveStorageFile(relativePath: string) {
+  const root = await fs.realpath(rootDir()).catch(() => path.resolve(rootDir()));
+  const target = path.resolve(root, String(relativePath ?? ""));
+  if (target !== root && !target.startsWith(root + path.sep)) throw Object.assign(new Error("文件路径越界。"), { code: "INVALID_PATH" });
+  const real = await fs.realpath(target);
+  if (real !== root && !real.startsWith(root + path.sep)) throw Object.assign(new Error("文件路径越界。"), { code: "INVALID_PATH" });
+  return real;
+}
+
 export async function readStorageFile(relativePath: string) {
-  return fs.readFile(path.join(rootDir(), relativePath));
+  return fs.readFile(await resolveStorageFile(relativePath));
 }
 
 export async function statStorageFile(relativePath: string) {
-  return fs.stat(path.join(rootDir(), relativePath));
+  return fs.stat(await resolveStorageFile(relativePath));
 }

@@ -86,6 +86,7 @@ export function handleRouteError(error: unknown) {
       return fail(code, message, { source: "upstream", upstreamStatus: status }, status);
     }
     if (code === "P2025") return fail("NOT_FOUND", requestErrorMessage(error), null, 404);
+    if (code === "INVALID_PATH") return fail("INVALID_PATH", requestErrorMessage(error), null, 400);
     if (code === "ENOENT") return fail("ASSET_MISSING", requestErrorMessage(error), null, 409);
     if (["P1001", "P1002", "P1008", "P2024", "P2034"].includes(code || "")) return fail("SERVICE_BUSY", "本地服务暂时繁忙，请稍后刷新。已有结果已保留。", null, 503);
     const providerError = mapProviderError(error);

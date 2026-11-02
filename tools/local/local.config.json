@@ -1,0 +1,24 @@
+{
+  "repo": {
+    "upstream": "ziguishian/MxPage",
+    "fork": "yzj160212/MxPage",
+    "tooling_branch": "toolbox",
+    "build_branch": "local",
+    "tag_regex": "^v?(\\d+)\\.(\\d+)\\.(\\d+)$",
+    "release_tag_prefix": "local-v"
+  },
+  "patch": "tools/local/security.patch",
+  "build": {
+    "workflow": ".github/workflows/local-build.yml",
+    "assets": [
+      "tools/local/build-local.sh",
+      "tools/local/install.sh",
+      "tools/local/local.config.json"
+    ]
+  },
+  "app": {
+    "display_name": "MxPage 本地加固版",
+    "product_name": "MxPage",
+    "artifact_template": "MxPage-{version}-macos-arm64.zip"
+  }
+}

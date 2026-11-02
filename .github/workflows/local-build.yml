@@ -1,0 +1,120 @@
+name: 本地加固版构建
+
+# 「构建 MxPage（含安全加固）arm64 包并发版」的唯一定义。
+#
+# 三条入口：
+#   * push 到 local —— 本机跑过 tools/local/sync_local.py；
+#   * workflow_dispatch —— 上游版本监控自己推了分支，而 bot 推送不能触发 workflow，
+#     但 dispatch 可以；
+#   * 也可以在 Actions 页面手动点。
+on:
+  push:
+    branches:
+      - local
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mxpage-local-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build MxPage arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        # dispatch 时 ref 由调用方指定，要显式尊重它，不能默认构建默认分支。
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=local-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "building version: $VERSION"
+
+      - name: Confirm the hardening patch is present
+        # 这个构建的全部意义就是带上 tools/local/security.patch。补丁掉了要立刻失败，
+        # 而不是发一个和上游一样有路径穿越漏洞的包。
+        run: |
+          set -euo pipefail
+          test -f middleware.ts || { echo "::error::缺少 middleware.ts（加固补丁未应用）"; exit 1; }
+          grep -q "文件路径越界" lib/storage/asset-manager.ts || { echo "::error::缺少存储路径加固"; exit 1; }
+          grep -q "realpathSync" desktop/agent-policy.cjs || { echo "::error::缺少桌面路径加固"; exit 1; }
+          echo "hardening patch present"
+
+      - name: Raise file descriptor limits
+        # electron-builder 的签名步骤会并发扫描未打包的 Node 依赖，默认限制下会 EMFILE。
+        # 上游的 desktop-release.yml 就是这么处理的；内核限制是本步骤生效，
+        # ulimit 必须在真正跑 electron-builder 的那个 shell 里设（见 build-local.sh）。
+        if: runner.os == 'macOS'
+        run: sudo sysctl -w kern.maxfiles=262144 kern.maxfilesperproc=131072
+
+      - name: Build, test and package
+        run: bash tools/local/build-local.sh
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          APP="dist-desktop/mac-arm64/MxPage.app"
+          test -d "$APP"
+          ARCHS="$(lipo -archs "$APP/Contents/MacOS/MxPage")"
+          case " $ARCHS " in
+            *" arm64 "*) ;;
+            *) echo "::error::产物不是 arm64：$ARCHS"; exit 1 ;;
+          esac
+          codesign --verify --deep --strict "$APP"
+          grep -q "文件路径无效" ".next-desktop/server/app/api/files/[...path]/route.js"
+          ls -lh dist-desktop/*.zip
+          echo "artifact OK: $ARCHS, signed, patch bundled"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACT="dist-desktop/MxPage-${VERSION}-macos-arm64.zip"
+          test -s "$ARTIFACT"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            cat > "$RUNNER_TEMP/notes.md" <<EOF
+          基于上游 [\`v${VERSION}\`](https://github.com/ziguishian/MxPage/releases) 构建的本地加固版。
+
+          - 含 \`tools/local/security.patch\`（存储路径越界、跨站请求、桌面路径符号链接三处加固）
+          - 仅 Apple Silicon（arm64）
+          - ad-hoc 签名、未公证：首次打开需右键 → 打开，或执行 \`xattr -dr com.apple.quarantine "/Applications/MxPage.app"\`
+
+          安装（一行）：
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/local/tools/local/install.sh | bash
+          \`\`\`
+          EOF
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "MxPage $VERSION · 本地加固版" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+          gh release upload "$TAG" "$ARTIFACT" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "uploaded $ARTIFACT to $TAG"

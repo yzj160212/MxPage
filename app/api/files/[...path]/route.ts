@@ -1,5 +1,7 @@
+import path from "node:path";
+
 import { readStorageFile } from "@/lib/storage/asset-manager";
-import { handleRouteError } from "@/lib/utils/route";
+import { fail, handleRouteError } from "@/lib/utils/route";
 
 function getContentType(pathname: string) {
   const normalized = pathname.toLowerCase();
@@ -18,7 +20,20 @@ export async function GET(
   context: { params: { path: string[] } },
 ) {
   try {
-    const relativePath = context.params.path.join("/");
+    const segments = context.params.path;
+    const unsafe = segments.some(
+      segment =>
+        !segment ||
+        segment === "." ||
+        segment === ".." ||
+        // A single URL segment must never carry a path separator, even when the
+        // client encodes it (%2f / %5c) so the router cannot split it for us.
+        /[\/\\\0]/.test(segment) ||
+        path.isAbsolute(segment),
+    );
+    if (unsafe) return fail("INVALID_PATH", "文件路径无效。", null, 400);
+
+    const relativePath = segments.join("/");
     const buffer = await readStorageFile(relativePath);
     const contentType = getContentType(relativePath);
 
