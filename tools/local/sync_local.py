@@ -169,9 +169,6 @@ def main() -> int:
 
     log(f"newest upstream tag: {target_tag}   current {build_branch} built on: {synced or '(branch absent)'}")
 
-    if not args.force and synced == target_tag:
-        log("nothing to do — already in sync")
-        return 0
     if not args.force and synced and tag_key(target_tag, tag_re) < tag_key(synced, tag_re):
         die(f"{target_tag} 比当前 {build_branch} 的基底 {synced} 更旧，拒绝倒退", 1)
 
@@ -217,7 +214,18 @@ def main() -> int:
                    "补丁内容见该文件；上游改动到补丁所覆盖的行时，sync_local.py 会停下来提示。"],
             worktree)
         commit = run(["git", "rev-parse", "HEAD"], worktree).stdout.strip()
+        new_tree = run(["git", "rev-parse", "HEAD^{tree}"], worktree).stdout.strip()
         log(f"committed {commit[:9]} on top of {target_tag}")
+
+        # 是否真的需要更新，不能只看「基底 tag 一样」：补丁或 workflow 改过也要重建。
+        # 比较重建结果的 tree 与现有分支的 tree，内容一致才算无事可做。
+        existing_tree = None
+        probe = run(["git", "rev-parse", "--verify", f"refs/heads/{build_branch}^{{tree}}"], repo, check=False)
+        if probe.returncode == 0:
+            existing_tree = probe.stdout.strip()
+        if existing_tree == new_tree and not args.force:
+            log(f"nothing to do — {build_branch} 内容无变化（tree {new_tree[:9]}）")
+            return 0
 
         moved = run(["git", "branch", "-f", build_branch, commit], repo, check=False)
         if moved.returncode != 0:
