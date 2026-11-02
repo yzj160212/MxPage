@@ -61,6 +61,13 @@ jobs:
           grep -q "realpathSync" desktop/agent-policy.cjs || { echo "::error::缺少桌面路径加固"; exit 1; }
           echo "hardening patch present"
 
+      - name: Raise file descriptor limits
+        # electron-builder 的签名步骤会并发扫描未打包的 Node 依赖，默认限制下会 EMFILE。
+        # 上游的 desktop-release.yml 就是这么处理的；内核限制是本步骤生效，
+        # ulimit 必须在真正跑 electron-builder 的那个 shell 里设（见 build-local.sh）。
+        if: runner.os == 'macOS'
+        run: sudo sysctl -w kern.maxfiles=262144 kern.maxfilesperproc=131072
+
       - name: Build, test and package
         run: bash tools/local/build-local.sh
 

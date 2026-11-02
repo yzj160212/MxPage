@@ -56,7 +56,10 @@ npm run build:desktop
 
 echo "==> 打包 arm64 zip"
 # osx-sign 会并发扫描未解包的 Node 依赖，需要放宽文件句柄上限。
-ulimit -n 65536 2>/dev/null || true
+# macOS 上真正的上限由内核 kern.maxfilesperproc 决定，CI 里由 workflow 用
+# sudo sysctl 抬高；这里只管把当前 shell 的软限制推到允许的最大值。
+ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+echo "    文件句柄上限: $(ulimit -n) (hard $(ulimit -Hn))"
 npx --no-install electron-builder --mac zip --arm64 --publish never
 
 ls -lh dist-desktop/*.zip
