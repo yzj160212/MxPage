@@ -34,6 +34,13 @@ if [ ! -d node_modules ]; then
   npm ci --no-audit --no-fund
 fi
 
+# 必须先清掉上一次的产物：electron-builder 会把已存在的 dist-desktop（它自己的输出目录）
+# 当成打包源，把上一版 app 嵌套进 .next-desktop/standalone，随后 codesign 会失败。
+if [ -d dist-desktop ] || [ -d .next-desktop ]; then
+  echo "==> 清理上次的构建产物"
+  rm -rf dist-desktop .next-desktop
+fi
+
 echo "==> 数据库迁移"
 npm run prisma:migrate
 
