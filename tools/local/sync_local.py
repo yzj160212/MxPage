@@ -158,10 +158,15 @@ def main() -> int:
         die("没找到上游 release tag")
 
     # local 永远是「tag + 1 个加固提交」，所以它基于哪个 tag 可以从分支本身推出来，
-    # 不需要任何状态文件。
+    # 不需要任何状态文件。CI 里只有 origin/local（没有本地 local 分支），本地反之。
+    branch_ref = None
+    for ref in (f"refs/remotes/{args.target}/{build_branch}", f"refs/heads/{build_branch}"):
+        if run(["git", "rev-parse", "--verify", ref], repo, check=False).returncode == 0:
+            branch_ref = ref
+            break
     synced = None
-    if run(["git", "rev-parse", "--verify", f"refs/heads/{build_branch}"], repo, check=False).returncode == 0:
-        parent = run(["git", "rev-parse", f"refs/heads/{build_branch}^"], repo, check=False)
+    if branch_ref:
+        parent = run(["git", "rev-parse", f"{branch_ref}^"], repo, check=False)
         if parent.returncode == 0:
             sha = parent.stdout.strip()
             synced = next((t for t in tags if run(["git", "rev-parse", t], repo).stdout.strip() == sha),
@@ -220,9 +225,11 @@ def main() -> int:
         # 是否真的需要更新，不能只看「基底 tag 一样」：补丁或 workflow 改过也要重建。
         # 比较重建结果的 tree 与现有分支的 tree，内容一致才算无事可做。
         existing_tree = None
-        probe = run(["git", "rev-parse", "--verify", f"refs/heads/{build_branch}^{{tree}}"], repo, check=False)
-        if probe.returncode == 0:
-            existing_tree = probe.stdout.strip()
+        for ref in (f"refs/remotes/{args.target}/{build_branch}", f"refs/heads/{build_branch}"):
+            probe = run(["git", "rev-parse", "--verify", f"{ref}^{{tree}}"], repo, check=False)
+            if probe.returncode == 0:
+                existing_tree = probe.stdout.strip()
+                break
         if existing_tree == new_tree and not args.force:
             log(f"nothing to do — {build_branch} 内容无变化（tree {new_tree[:9]}）")
             return 0

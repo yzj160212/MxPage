@@ -39,6 +39,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: toolbox
+          # 完整克隆：sync_local.py 要在临时 worktree 里检出上游 tag 并提交，
+          # 浅克隆会让「提交在 tag 之上」和推送都不可靠。
+          fetch-depth: 0
 
       - name: Compare upstream tags
         id: compare
@@ -90,7 +93,7 @@ jobs:
           mkdir -p .watch
           {
             echo "last_check: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "newest_upstream: ${{ steps.compare.outputs.tag || 'unknown' }}"
+            echo "newest_upstream: ${{ steps.compare.outputs.newest || 'unknown' }}"
             echo "updated: ${{ steps.compare.outputs.updated }}"
           } > .watch/last-check
           git add .watch/last-check
@@ -98,7 +101,9 @@ jobs:
           git push origin HEAD:toolbox || true
 
       - name: Rebuild the hardened branch
-        if: steps.compare.outputs.updated == 'true'
+        # 不只看上游版本：补丁或 workflow 本身改过也要重建，所以这里总是跑一次，
+        # 由 sync_local.py 用 tree 比对决定是否真的更新。
+        id: rebuild
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -108,15 +113,23 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/ziguishian/MxPage.git" 2>/dev/null || true
           git fetch --no-tags upstream --tags
+          git fetch origin "+refs/heads/local:refs/remotes/origin/local" || true
 
-          python3 tools/local/sync_local.py \
-            --tag "${{ steps.compare.outputs.tag }}" \
-            --upstream upstream \
-            --target origin \
-            --force
+          BEFORE="$(git rev-parse refs/remotes/origin/local 2>/dev/null || echo none)"
+          python3 tools/local/sync_local.py --upstream upstream --target origin
+          git fetch origin "+refs/heads/local:refs/remotes/origin/local"
+          AFTER="$(git rev-parse refs/remotes/origin/local)"
+
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "local unchanged ($AFTER)"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "local rebuilt: $BEFORE -> $AFTER"
+          fi
 
       - name: Start the build
-        if: steps.compare.outputs.updated == 'true'
+        if: steps.rebuild.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -125,4 +138,4 @@ jobs:
           gh workflow run local-build.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref local
-          echo "dispatched build against local@${{ steps.compare.outputs.tag }}"
+          echo "dispatched build against local"
